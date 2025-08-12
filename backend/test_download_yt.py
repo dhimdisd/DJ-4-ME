@@ -1,31 +1,47 @@
 #!/usr/bin/env python3
 # yt_playlist_to_dj_metadata.py
-# Adds --localdir mode to analyze existing audio files without downloading.
+# - Lists a YouTube playlist (yt-dlp), optionally downloads audio (wav/mp3)
+# - Analyzes local audio: BPM, beats, phrases, bars, K-S key, Camelot, loudness
+# - Adds: downbeat (bar-1) estimation + vocal-likelihood curve (avoid vocals)
+# - Exports: CSV (summary) + per-track JSON (.djmeta.json) with rich metadata
 
 import argparse
 import json
 import logging
+import math
 import shutil
 import sys
 import traceback
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import yt_dlp
-import librosa
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks  # modern replacement for deprecated peak_pick
+import librosa
+from scipy.signal import find_peaks
 
-# Optional loudness lib
+# Optional deps
+try:
+    import yt_dlp  # only needed if you use --playlist/--download
+    HAS_YT_DLP = True
+except Exception:
+    HAS_YT_DLP = False
+
 try:
     import pyloudnorm as pyln
     HAS_LOUDNORM = True
 except Exception:
     HAS_LOUDNORM = False
 
+try:
+    import scipy.ndimage as ndi
+    HAS_SNDIMAGE = True
+except Exception:
+    HAS_SNDIMAGE = False
+
+
 # -------------------------
-# Logging setup
+# Logging
 # -------------------------
 LOG_PATH = Path("dj_pipeline.log")
 
@@ -33,7 +49,6 @@ def setup_logging(verbosity: int = 1):
     level = logging.INFO if verbosity == 1 else (logging.DEBUG if verbosity >= 2 else logging.WARNING)
     logger = logging.getLogger()
     logger.setLevel(level)
-
     fmt = logging.Formatter("[%(levelname)s] %(message)s")
 
     ch = logging.StreamHandler(sys.stdout)
@@ -44,62 +59,42 @@ def setup_logging(verbosity: int = 1):
     fh.setFormatter(fmt)
     fh.setLevel(level)
 
-    logger.handlers.clear()
-    logger.addHandler(ch)
-    logger.addHandler(fh)
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        logger.addHandler(ch)
+    if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        logger.addHandler(fh)
+
     logging.info("Logging to console and %s", LOG_PATH.resolve())
 
+
 # -------------------------
-# NumPy-safe helpers
+# Small utils
 # -------------------------
 def to_float(x) -> float:
     try:
         arr = np.asarray(x)
         if arr.ndim == 0:
             return float(arr.item())
-        if arr.ndim >= 1:
-            return float(arr.flat[0])
+        return float(arr.flat[0])
     except Exception:
-        pass
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
 
 def r2(x) -> float:
     return round(to_float(x), 2)
 
-def list_r2(seq, limit=None):
-    if seq is None:
-        return []
-    out = [r2(v) for v in seq]
-    return out[:limit] if limit is not None else out
-
-# -------------------------
-# Serato-ish helpers
-# -------------------------
-def beat_bar_from_time(t: float, bpm: float) -> tuple[int, int]:
-    beat_dur = 60.0 / max(1e-6, bpm)
-    bar_dur  = 4 * beat_dur
-    beat_idx = int(round(t / beat_dur)) + 1
-    bar_idx  = int(round(t / bar_dur)) + 1
-    return beat_idx, bar_idx
-
-def phrase_candidates(beat_times: np.ndarray, phrase_beats: int = 32) -> list[float]:
-    if beat_times is None or len(beat_times) == 0:
-        return []
-    idxs = range(0, len(beat_times), phrase_beats)
-    return [float(beat_times[i]) for i in idxs]
-
-# -------------------------
-# yt-dlp helpers (playlist mode)
-# -------------------------
 def ffmpeg_ok() -> bool:
     ok = shutil.which("ffmpeg") is not None
     if not ok:
-        logging.warning("FFmpeg not found on PATH. Install FFmpeg for audio extraction/conversion.")
+        logging.warning("FFmpeg not found on PATH. Install it for audio extraction/conversion.")
     return ok
 
+
+# -------------------------
+# yt-dlp (optional)
+# -------------------------
 def build_ydl_opts(
     outdir: Path,
     prefer_codec: str = "wav",
@@ -112,7 +107,6 @@ def build_ydl_opts(
         "quiet": True,
         "outtmpl": str(outdir / "%(title)s.%(ext)s"),
     }
-
     if extract_flat:
         ydl_opts["extract_flat"] = True
         ydl_opts["skip_download"] = True
@@ -124,15 +118,14 @@ def build_ydl_opts(
             "preferredcodec": prefer_codec,
             "preferredquality": prefer_quality,
         }]
-
     if cookies_from_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
         logging.info("Using cookies from browser: %s", cookies_from_browser)
     elif cookiefile:
         ydl_opts["cookiefile"] = cookiefile
         logging.info("Using cookiefile: %s", cookiefile)
-
     return ydl_opts
+
 
 def create_ydl(
     listing: bool,
@@ -141,7 +134,9 @@ def create_ydl(
     mp3_bitrate: str,
     cookies_from_browser: Optional[str],
     cookiefile: Optional[str],
-) -> yt_dlp.YoutubeDL:
+):
+    if not HAS_YT_DLP:
+        raise RuntimeError("yt_dlp is not installed. pip install yt-dlp")
     quality = "0" if codec == "wav" else mp3_bitrate
     opts = build_ydl_opts(
         outdir=outdir,
@@ -153,9 +148,10 @@ def create_ydl(
     )
     return yt_dlp.YoutubeDL(opts)
 
+
 def list_playlist(
     playlist_url: str,
-    ydl_list: yt_dlp.YoutubeDL
+    ydl_list
 ) -> Tuple[List[Dict], str]:
     logging.info("Fetching playlist: %s", playlist_url)
     try:
@@ -163,7 +159,6 @@ def list_playlist(
         entries = info.get("entries", []) or []
         playlist_title = info.get("title") or "playlist"
         logging.info("Found %d videos in playlist: %s", len(entries), playlist_title)
-
         flat = []
         for e in entries:
             if not e:
@@ -181,21 +176,19 @@ def list_playlist(
         traceback.print_exc()
         return [], "playlist"
 
+
 def download_one(
     video_url: str,
-    ydl_dl: yt_dlp.YoutubeDL,
+    ydl_dl,
     outdir: Path,
     codec: str
 ) -> Optional[Path]:
     logging.info("Downloading %s from: %s", codec.upper(), video_url)
     outdir.mkdir(parents=True, exist_ok=True)
-
     if not ffmpeg_ok():
         logging.warning("FFmpeg is required to convert to %s. Attempting anyway; may fail.", codec.upper())
-
     try:
         info = ydl_dl.extract_info(video_url, download=True)
-
         candidate = None
         try:
             reqs = info.get("requested_downloads") or []
@@ -203,35 +196,29 @@ def download_one(
                 candidate = Path(reqs[0]["filepath"])
         except Exception:
             pass
-
         if not candidate:
             title = (info.get("title") or "track").replace("/", "-")
             candidate = next((p for p in outdir.glob(f"{title}.{codec}")), None)
-
         if candidate and candidate.exists():
             logging.info("Saved %s: %s", codec.upper(), candidate)
             return candidate
-
         logging.warning("Could not locate downloaded %s file for: %s", codec.upper(), video_url)
-        return None
-
-    except yt_dlp.utils.DownloadError as e:
-        logging.error("Download failed (DownloadError) for %s: %s", video_url, e)
-        logging.error("If you saw a 'Sign in to confirm you’re not a bot' message, pass cookies via --browser or --cookiefile.")
         return None
     except Exception as e:
         logging.error("%s download failed for %s: %s", codec.upper(), video_url, e)
         traceback.print_exc()
         return None
 
+
 # -------------------------
-# DJ analysis helpers
+# Music theory + analysis helpers
 # -------------------------
 _PITCH_NAMES   = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 _CAMELOT_MAJOR = ["8B","3B","10B","5B","12B","7B","2B","9B","4B","11B","6B","1B"]
 _CAMELOT_MINOR = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"]
 
 def estimate_key_ks(y, sr):
+    """Krumhansl–Schmuckler key estimate: returns (root, mode, camelot, confidence)."""
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     chroma_mean = librosa.util.normalize(chroma.mean(axis=1), norm=1)
 
@@ -244,34 +231,22 @@ def estimate_key_ks(y, sr):
         scores.append(("maj", root, float(np.dot(np.roll(maj_prof, root), chroma_mean))))
         scores.append(("min", root, float(np.dot(np.roll(min_prof, root), chroma_mean))))
 
-    mode, root, _ = max(scores, key=lambda x: x[2])
-    sorted_scores = sorted(scores, key=lambda x: x[2], reverse=True)
-    conf = sorted_scores[0][2] - sorted_scores[1][2]
+    mode, root, top = max(scores, key=lambda x: x[2])
+    scores_sorted = sorted(scores, key=lambda x: x[2], reverse=True)
+    conf = float(scores_sorted[0][2] - scores_sorted[1][2])
 
     key_root = _PITCH_NAMES[root]
     camelot  = _CAMELOT_MAJOR[root] if mode == "maj" else _CAMELOT_MINOR[root]
-    return key_root, ("major" if mode=="maj" else "minor"), camelot, r2(conf)
+    return key_root, ("major" if mode=="maj" else "minor"), camelot, round(conf, 4)
 
-def camelot_distance(c1: str, c2: str) -> int:
-    if not c1 or not c2:
-        return 99
-    def parse(c):
-        return int(c[:-1]), c[-1].upper()
-    n1, m1 = parse(c1); n2, m2 = parse(c2)
-    if m1 == m2:
-        d = min((n1-n2) % 12, (n2-n1) % 12)
-        return int(d)
-    if n1 == n2:
-        return 1
-    return 2
 
 def energy_features(y, sr, include_curve: bool = False):
     hop = 1024
     frame_len = 2048
     rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
     rms_db = 20*np.log10(np.maximum(rms, 1e-8))
-    rms_db_mean = to_float(rms_db.mean())
-    rms_db_std  = to_float(rms_db.std())
+    rms_db_mean = float(rms_db.mean())
+    rms_db_std  = float(rms_db.std())
 
     if not include_curve:
         return rms_db_mean, rms_db_std, None, None
@@ -283,13 +258,92 @@ def energy_features(y, sr, include_curve: bool = False):
     times_ds  = librosa.frames_to_time(np.arange(len(rms_db))[::step], sr=sr, hop_length=hop)
     return rms_db_mean, rms_db_std, times_ds.tolist(), rms_db_ds.tolist()
 
+
 def estimate_lufs(y, sr) -> Optional[float]:
     if not HAS_LOUDNORM:
         return None
     meter = pyln.Meter(sr)
-    loudness = meter.integrated_loudness(y.astype(np.float64))
-    return r2(loudness)
+    loudness = float(meter.integrated_loudness(y.astype(np.float64)))
+    return round(loudness, 2)
 
+
+# --- Downbeat & bars ---
+def estimate_downbeat_offset(y, sr, beat_frames) -> int:
+    """
+    Heuristic downbeat (bar-1) offset in 4/4: pick the shift 0..3 with max onset strength on bar starts.
+    """
+    if beat_frames is None or len(beat_frames) < 8:
+        return 0
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    scores = []
+    for shift in range(4):
+        idxs = beat_frames[shift::4]
+        vals = []
+        for fr in idxs:
+            fr = int(fr)
+            fr = max(0, min(fr, len(onset_env)-1))
+            vals.append(onset_env[fr])
+        scores.append(float(np.mean(vals)) if vals else 0.0)
+    return int(np.argmax(scores))
+
+
+def bars_from_beats_with_offset(beat_times: np.ndarray, offset: int = 0) -> List[float]:
+    if beat_times is None or len(beat_times) == 0:
+        return []
+    out = []
+    for i in range(offset, len(beat_times), 4):
+        out.append(float(beat_times[i]))
+    return [round(t, 2) for t in out]
+
+
+# --- Vocal-likelihood ---
+def vocal_likelihood_curve(y, sr, include_curve=True):
+    """
+    Crude vocal activity 0..1 from harmonic energy in 300–3400 Hz.
+    (Requires SciPy for smoothing; falls back to unsmoothed if absent.)
+    """
+    y_h, _ = librosa.effects.hpss(y)
+    S = librosa.feature.melspectrogram(y=y_h, sr=sr, n_fft=2048, hop_length=512, n_mels=64)
+    freqs = librosa.mel_frequencies(n_mels=S.shape[0], fmin=0, fmax=sr//2)
+
+    band = (freqs >= 300) & (freqs <= 3400)
+    band_energy = S[band].sum(axis=0)
+    total_energy = np.maximum(S.sum(axis=0), 1e-8)
+    raw = band_energy / total_energy
+
+    if HAS_SNDIMAGE:
+        smoothed = ndi.gaussian_filter1d(raw.astype(np.float32), sigma=2)
+    else:
+        smoothed = raw  # no smoothing fallback
+
+    vl = smoothed - smoothed.min()
+    denom = float(vl.max()) or 1.0
+    vl = vl / denom
+
+    times = librosa.frames_to_time(np.arange(len(vl)), sr=sr, hop_length=512)
+    if not include_curve:
+        return float(np.mean(vl)), None, None
+
+    target_rate = 10.0
+    frames_per_sec = sr / 512.0
+    step = max(1, int(frames_per_sec / target_rate))
+    vl_ds = vl[::step]
+    times_ds = times[::step]
+    return float(np.mean(vl)), times_ds.tolist(), vl_ds.tolist()
+
+
+def vocal_score_around(times: np.ndarray, values: np.ndarray, t: float, win: float = 4.0) -> float:
+    if times is None or values is None or len(times) == 0:
+        return 0.0
+    lo, hi = t - win/2, t + win/2
+    mask = (times >= lo) & (times <= hi)
+    if not np.any(mask):
+        idx = int(np.argmin(np.abs(times - t)))
+        return float(values[idx])
+    return float(np.mean(values[mask]))
+
+
+# --- Structure heuristics (intro/outro/drops) ---
 def structure_heuristics(y, sr, beat_times):
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     onset_times = librosa.times_like(onset_env, sr=sr)
@@ -305,9 +359,10 @@ def structure_heuristics(y, sr, beat_times):
 
     rms_db_mean, rms_db_std, times_ds, rms_db_ds = energy_features(y, sr, include_curve=True)
 
+    # Intro end: energy above (mean - 0.5*std) for >= 8s
     thresh = rms_db_mean - 0.5*rms_db_std
     intro_end_s = 0.0
-    if times_ds:
+    if times_ds is not None and len(times_ds) > 0:
         acc = 0.0
         last_t = to_float(times_ds[0])
         for t, e in zip(times_ds, rms_db_ds):
@@ -322,13 +377,17 @@ def structure_heuristics(y, sr, beat_times):
             else:
                 acc = 0.0
 
+    # Outro start: last 32 beats fallback
     if len(beat_times) >= 33:
-        outro_start_s = to_float(beat_times[-32])
+        beat_dur = (to_float(beat_times[-1]) - to_float(beat_times[0])) / max(1, len(beat_times)-1)
+        out_idx = max(0, len(beat_times) - 32)
+        outro_start_s = float(beat_times[out_idx])
     else:
-        outro_start_s = to_float(beat_times[0]) if len(beat_times) else 0.0
+        outro_start_s = float(beat_times[0]) if len(beat_times) else 0.0
 
+    # Breakdowns: local minima over ~6s windows (on energy curve)
     breakdowns = []
-    if times_ds and len(times_ds) > 2:
+    if times_ds is not None and len(times_ds) > 2:
         dt = max(1e-6, to_float(times_ds[1]) - to_float(times_ds[0]))
         win = max(1, int(6.0 / dt))
         for i in range(win, len(rms_db_ds)-win):
@@ -337,6 +396,7 @@ def structure_heuristics(y, sr, beat_times):
             if center == min(window_vals) and center < (rms_db_mean - 0.3*rms_db_std):
                 breakdowns.append(to_float(times_ds[i]))
 
+    # Drops: strong onsets shortly after a breakdown
     drops = []
     if onset_peaks_s and breakdowns:
         b_iter = iter(breakdowns)
@@ -353,114 +413,34 @@ def structure_heuristics(y, sr, beat_times):
     return {
         "intro_end_s": r2(intro_end_s),
         "outro_start_s": r2(outro_start_s),
-        "onset_peaks_s": list_r2(onset_peaks_s, limit=20),
-        "breakdowns_s":  list_r2(breakdowns, limit=10),
-        "drops_s":       list_r2(drops, limit=10),
+        "onset_peaks_s": [r2(x) for x in onset_peaks_s[:20]],
+        "breakdowns_s":  [r2(x) for x in breakdowns[:10]],
+        "drops_s":       [r2(x) for x in drops[:10]],
         "rms_db_mean": r2(rms_db_mean),
         "rms_db_std":  r2(rms_db_std),
         "energy_curve": {
-            "times_s": list_r2(times_ds or [], limit=600),
-            "rms_db":  list_r2(rms_db_ds or [], limit=600),
+            "times_s": [r2(x) for x in (times_ds or [])[:600]],
+            "rms_db":  [r2(x) for x in (rms_db_ds or [])[:600]],
         }
     }
+
 
 def phrase_markers(beat_times, beats_per_bar=4, bars_per_phrase=8):
     phrase = beats_per_bar * bars_per_phrase  # 32
     markers = []
     for i in range(0, len(beat_times), phrase):
-        markers.append(to_float(beat_times[i]))
-    return list_r2(markers)
+        markers.append(float(beat_times[i]))
+    return [round(t,2) for t in markers]
 
-def bar_starts(beat_times, beats_per_bar=4):
+def bar_starts_simple(beat_times, beats_per_bar=4):
     markers = []
     for i in range(0, len(beat_times), beats_per_bar):
-        markers.append(to_float(beat_times[i]))
-    return list_r2(markers, limit=200)
+        markers.append(float(beat_times[i]))
+    return [round(t,2) for t in markers]
+
 
 # -------------------------
-# NEW: Mix-in/out suggestion logic
-# -------------------------
-def nearest_energy_rise_times(y: np.ndarray, sr: int, times: List[float]) -> List[tuple[float, float]]:
-    hop = 1024
-    frame_len = 2048
-    rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
-    rms_db = 20*np.log10(np.maximum(rms, 1e-8))
-    rms_t  = librosa.frames_to_time(np.arange(len(rms_db)), sr=sr, hop_length=hop)
-
-    def local_slope(center_s: float, win_s: float = 2.0) -> float:
-        lo, hi = center_s - win_s, center_s + win_s
-        mask = (rms_t >= lo) & (rms_t <= hi)
-        m = rms_db[mask]
-        t = rms_t[mask]
-        if len(m) < 3:
-            return 0.0
-        tn = t - t.mean()
-        denom = float((tn**2).sum()) or 1.0
-        slope = float((tn * (m - m.mean())).sum()) / denom
-        return slope
-
-    return [(t, local_slope(t)) for t in times]
-
-def suggest_mix_points(
-    y: np.ndarray,
-    sr: int,
-    bpm: float,
-    beat_times: np.ndarray,
-    intro_end_s: float | None
-) -> dict:
-    phrase_starts = phrase_candidates(beat_times, phrase_beats=32)
-    if not phrase_starts:
-        return {"mix_in_candidates": [], "mix_out_candidates": [], "best_mix_in": None, "best_mix_out": None}
-
-    # MIX-IN: phrase starts AFTER intro_end_s, prefer rising energy
-    min_start = float(intro_end_s or 0.0)
-    mix_in_times = [t for t in phrase_starts if t >= min_start]
-    slopes = dict(nearest_energy_rise_times(y, sr, mix_in_times))
-    mix_in_scored = []
-    for t in mix_in_times:
-        beat_idx, bar_idx = beat_bar_from_time(t, bpm)
-        score = slopes.get(t, 0.0)
-        mix_in_scored.append({
-            "time_s": round(t, 2),
-            "beat_idx": beat_idx,
-            "bar_idx": bar_idx,
-            "score": round(float(score), 4)
-        })
-    mix_in_scored.sort(key=lambda x: x["score"], reverse=True)
-    best_mix_in = mix_in_scored[0] if mix_in_scored else None
-
-    # MIX-OUT: last 32–64 beats (one or two phrases from the end)
-    last_beat_t = float(beat_times[-1]) if len(beat_times) else 0.0
-    beat_dur = 60.0 / max(1e-6, bpm)
-    last32_t  = last_beat_t - 32 * beat_dur
-    last64_t  = last_beat_t - 64 * beat_dur
-    mix_out_times = [t for t in phrase_starts if t >= last64_t]
-    slopes_out = dict(nearest_energy_rise_times(y, sr, mix_out_times))
-    mix_out_scored = []
-    for t in mix_out_times:
-        beat_idx, bar_idx = beat_bar_from_time(t, bpm)
-        slope = slopes_out.get(t, 0.0)
-        score = -abs(float(slope))
-        if t >= last32_t:
-            score += 0.1
-        mix_out_scored.append({
-            "time_s": round(t, 2),
-            "beat_idx": beat_idx,
-            "bar_idx": bar_idx,
-            "score": round(score, 4)
-        })
-    mix_out_scored.sort(key=lambda x: x["score"], reverse=True)
-    best_mix_out = mix_out_scored[0] if mix_out_scored else None
-
-    return {
-        "mix_in_candidates": mix_in_scored[:8],
-        "mix_out_candidates": mix_out_scored[:8],
-        "best_mix_in": best_mix_in,
-        "best_mix_out": best_mix_out,
-    }
-
-# -------------------------
-# Analyze one track
+# Analyze one audio file
 # -------------------------
 def analyze_audio(path: Path) -> Dict:
     logging.info("Analyzing audio: %s", path)
@@ -468,33 +448,44 @@ def analyze_audio(path: Path) -> Dict:
         y, sr = librosa.load(path, sr=None, mono=True)
         logging.debug("Audio loaded: %d samples @ %d Hz", len(y), sr)
 
+        # Tempo & beats
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
         beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-        bpm = to_float(tempo)
+        bpm = float(tempo)
         bars = int(len(beat_times) // 4)
 
+        # Key (K-S)
         key_root, mode, camelot, key_conf = estimate_key_ks(y, sr)
 
+        # Structure
         struct = structure_heuristics(y, sr, beat_times)
         phrases = phrase_markers(beat_times)
-        bars_s  = bar_starts(beat_times)
+        bars_simple = bar_starts_simple(beat_times)
 
-        mix_suggestions = suggest_mix_points(
-            y=y, sr=sr, bpm=bpm, beat_times=beat_times, intro_end_s=struct.get("intro_end_s")
-        )
+        # Downbeat alignment
+        downbeat_offset = estimate_downbeat_offset(y, sr, beat_frames)
+        bars_downbeat = bars_from_beats_with_offset(beat_times, downbeat_offset)
+        bar1_time_s   = bars_downbeat[0] if bars_downbeat else (float(beat_times[0]) if len(beat_times) else 0.0)
 
-        if phrases:
-            mix_in_time = next((t for t in phrases if t >= struct["intro_end_s"]),
-                               phrases[min(1, len(phrases)-1)])
-        else:
-            mix_in_time = to_float(beat_times[32]) if len(beat_times) > 32 else 0.0
+        # Vocal likelihood
+        vocal_mean, vocal_t, vocal_v = vocal_likelihood_curve(y, sr, include_curve=True)
+        LOW_VOCAL_THR = 0.4
+        low_vocal_bar_starts = []
+        for bt in bars_downbeat:
+            vs = vocal_score_around(np.asarray(vocal_t), np.asarray(vocal_v), float(bt), win=4.0)
+            if vs <= LOW_VOCAL_THR:
+                low_vocal_bar_starts.append(round(float(bt), 2))
+
+        # Mix cues (basic)
+        mix_in_time = phrases[1] if len(phrases) > 1 else (beat_times[32] if len(beat_times) > 32 else 0.0)
         mix_out_time = struct["outro_start_s"]
 
+        # Loudness (optional)
         lufs = estimate_lufs(y, sr)
 
         result = {
             "title": path.stem,
-            "bpm": r2(bpm),
+            "bpm": round(bpm, 2),
             "beats_count": int(len(beat_times)),
             "bars_count": bars,
             "key_root": key_root,
@@ -506,7 +497,11 @@ def analyze_audio(path: Path) -> Dict:
             "intro_end_s": struct["intro_end_s"],
             "outro_start_s": struct["outro_start_s"],
             "phrase_boundaries_s": phrases[:50],
-            "bar_starts_s": bars_s,
+            "bar_starts_s": bars_simple[:200],
+            "downbeat_offset": int(downbeat_offset),
+            "bar1_time_s": r2(bar1_time_s),
+            "downbeat_bar_starts_s": bars_downbeat[:200],
+            "low_vocal_bar_starts_s": low_vocal_bar_starts[:200],
             "onset_peaks_s": struct["onset_peaks_s"],
             "breakdowns_s": struct["breakdowns_s"],
             "drops_s": struct["drops_s"],
@@ -514,20 +509,15 @@ def analyze_audio(path: Path) -> Dict:
             "rms_db_std": struct["rms_db_std"],
             "lufs_integrated": lufs,
             "energy_curve_sample": struct["energy_curve"],
-            "mix_in_candidates": mix_suggestions["mix_in_candidates"],
-            "mix_out_candidates": mix_suggestions["mix_out_candidates"],
-            "best_mix_in": mix_suggestions["best_mix_in"],
-            "best_mix_out": mix_suggestions["best_mix_out"],
+            "vocal_mean": round(float(vocal_mean), 3),
+            "vocal_curve_sample": {
+                "times_s": [r2(t) for t in (vocal_t or [])][:600],
+                "values":  [round(float(v),3) for v in (vocal_v or [])][:600],
+            }
         }
-        logging.info("BPM %.2f | Key %s %s (%s) | Phrases %d | Bars %d",
+        logging.info("BPM %.2f | Key %s %s (%s) | Bars %d | Phrases %d | Downbeat offset %d",
                      result["bpm"], result["key_root"], result["mode"], result["camelot"],
-                     len(result["phrase_boundaries_s"]), result["bars_count"])
-        if result["best_mix_in"]:
-            b = result["best_mix_in"]
-            logging.info('[MIX-IN] t=%ss | Beat %d | Bar %d', b["time_s"], b["beat_idx"], b["bar_idx"])
-        if result["best_mix_out"]:
-            b = result["best_mix_out"]
-            logging.info('[MIX-OUT] t=%ss | Beat %d | Bar %d', b["time_s"], b["beat_idx"], b["bar_idx"])
+                     result["bars_count"], len(result["phrase_boundaries_s"]), result["downbeat_offset"])
         return result
 
     except Exception as e:
@@ -539,17 +529,16 @@ def analyze_audio(path: Path) -> Dict:
             "key_root": None, "mode": None, "camelot": None, "key_confidence": None,
             "mix_in_time_s": None, "mix_out_time_s": None,
             "intro_end_s": None, "outro_start_s": None,
-            "phrase_boundaries_s": [], "bar_starts_s": [],
+            "phrase_boundaries_s": [], "bar_starts_s": [], "downbeat_bar_starts_s": [],
+            "downbeat_offset": None, "bar1_time_s": None, "low_vocal_bar_starts_s": [],
             "onset_peaks_s": [], "breakdowns_s": [], "drops_s": [],
             "rms_db_mean": None, "rms_db_std": None, "lufs_integrated": None,
             "energy_curve_sample": {"times_s": [], "rms_db": []},
-            "mix_in_candidates": [], "mix_out_candidates": [],
-            "best_mix_in": None, "best_mix_out": None,
+            "vocal_mean": None, "vocal_curve_sample": {"times_s": [], "values": []},
         }
 
+
 def write_track_json(audio_path: Path, analysis: Dict):
-    if not audio_path:
-        return
     meta_path = audio_path.with_suffix("").with_suffix(".djmeta.json")
     try:
         with open(meta_path, "w", encoding="utf-8") as f:
@@ -558,61 +547,9 @@ def write_track_json(audio_path: Path, analysis: Dict):
     except Exception as e:
         logging.warning("Failed to write track JSON for %s: %s", audio_path, e)
 
-# -------------------------
-# Local analysis mode
-# -------------------------
-SUPPORTED_EXTS = {".wav", ".mp3", ".m4a", ".flac", ".aiff", ".aif", ".alac", ".ogg"}
-
-def iter_audio_files(folder: Path, recursive: bool = True) -> List[Path]:
-    if not folder.exists():
-        return []
-    patterns = ["**/*"] if recursive else ["*"]
-    out = []
-    for pat in patterns:
-        for p in folder.glob(pat):
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
-                out.append(p)
-    return sorted(out)
-
-def process_local_folder(
-    localdir: Path,
-    csv_path: Optional[Path],
-) -> None:
-    logging.info("Analyzing local folder: %s", localdir.resolve())
-    files = iter_audio_files(localdir, recursive=True)
-    if not files:
-        logging.error("No audio files found in %s (exts: %s)", localdir, ", ".join(sorted(SUPPORTED_EXTS)))
-        return
-
-    if csv_path is None:
-        csv_path = localdir / "local_analysis.csv"
-
-    rows = []
-    for i, audio_path in enumerate(files, 1):
-        logging.info("[LOCAL %d/%d] %s", i, len(files), audio_path.name)
-        analysis = analyze_audio(audio_path)
-        write_track_json(audio_path, analysis)
-        rows.append({
-            "title": analysis.get("title") or audio_path.stem,
-            "youtube_url": "",
-            "downloaded_path": str(audio_path),
-            "bpm": analysis.get("bpm"),
-            "camelot": analysis.get("camelot"),
-            "intro_end_s": analysis.get("intro_end_s"),
-            "mix_in_time_s": analysis.get("mix_in_time_s"),
-            "mix_out_time_s": analysis.get("mix_out_time_s"),
-            "outro_start_s": analysis.get("outro_start_s"),
-            "best_mix_in": json.dumps(analysis.get("best_mix_in"), ensure_ascii=False) if analysis.get("best_mix_in") else "",
-            "best_mix_out": json.dumps(analysis.get("best_mix_out"), ensure_ascii=False) if analysis.get("best_mix_out") else "",
-        })
-
-    df = pd.DataFrame(rows)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(csv_path, index=False)
-    logging.info("Saved %d rows to %s", len(df), csv_path.resolve())
 
 # -------------------------
-# Playlist pipeline (unchanged)
+# Main pipeline
 # -------------------------
 def process_playlist(
     playlist_url: str,
@@ -624,34 +561,35 @@ def process_playlist(
     cookies_from_browser: Optional[str],
     cookiefile: Optional[str],
 ) -> None:
+    if not HAS_YT_DLP:
+        logging.error("yt-dlp not installed. Install or use --localdir to analyze local audio.")
+        return
+
     logging.info("Starting playlist processing...")
 
+    # Listing YDL
     ydl_list = create_ydl(
         listing=True,
-        outdir=Path("."),
-        codec=codec,
-        mp3_bitrate=mp3_bitrate,
-        cookies_from_browser=cookies_from_browser,
-        cookiefile=cookiefile,
+        outdir=Path("."), codec=codec, mp3_bitrate=mp3_bitrate,
+        cookies_from_browser=cookies_from_browser, cookiefile=cookiefile,
     )
     items, playlist_title = list_playlist(playlist_url, ydl_list)
     if not items:
         logging.error("No playlist items found. Exiting.")
         return
 
+    # Default CSV: in outdir, named after playlist
     if csv_path is None:
         safe_title = "".join(ch for ch in playlist_title if ch.isalnum() or ch in " _-").strip()
         csv_path = outdir / f"{safe_title or 'playlist'}.csv"
 
+    # Create one YDL for downloads
     ydl_dl = None
     if download_audio:
         ydl_dl = create_ydl(
             listing=False,
-            outdir=outdir,
-            codec=codec,
-            mp3_bitrate=mp3_bitrate,
-            cookies_from_browser=cookies_from_browser,
-            cookiefile=cookiefile,
+            outdir=outdir, codec=codec, mp3_bitrate=mp3_bitrate,
+            cookies_from_browser=cookies_from_browser, cookiefile=cookiefile,
         )
 
     rows = []
@@ -664,75 +602,97 @@ def process_playlist(
         if download_audio and ydl_dl is not None:
             audio_path = download_one(url, ydl_dl, outdir, codec)
 
+        # Analyze only if file exists
         if audio_path and audio_path.exists():
             analysis = analyze_audio(audio_path)
-            if title and not analysis.get("title"):
-                analysis["title"] = title
             write_track_json(audio_path, analysis)
         else:
-            if download_audio:
-                logging.warning("Skipping analysis (file missing or download failed): %s", title)
-            analysis = {
-                "title": title,
-                "bpm": None, "beats_count": None, "bars_count": None,
-                "key_root": None, "mode": None, "camelot": None, "key_confidence": None,
-                "mix_in_time_s": None, "mix_out_time_s": None,
-                "intro_end_s": None, "outro_start_s": None,
-                "best_mix_in": None, "best_mix_out": None,
-            }
+            logging.info("Skipping analysis (file missing or --download not set): %s", title)
+            analysis = {"title": title, "bpm": None, "key_root": None, "mode": None, "camelot": None}
 
         rows.append({
-            "title": analysis.get("title") or title,
+            "title": title,
             "youtube_url": url,
             "downloaded_path": str(audio_path) if audio_path else "",
             "bpm": analysis.get("bpm"),
             "camelot": analysis.get("camelot"),
+            "key_root": analysis.get("key_root"),
+            "mode": analysis.get("mode"),
             "intro_end_s": analysis.get("intro_end_s"),
-            "mix_in_time_s": analysis.get("mix_in_time_s"),
-            "mix_out_time_s": analysis.get("mix_out_time_s"),
             "outro_start_s": analysis.get("outro_start_s"),
-            "best_mix_in": json.dumps(analysis.get("best_mix_in"), ensure_ascii=False) if analysis.get("best_mix_in") else "",
-            "best_mix_out": json.dumps(analysis.get("best_mix_out"), ensure_ascii=False) if analysis.get("best_mix_out") else "",
         })
 
     df = pd.DataFrame(rows)
     outdir.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
     logging.info("Saved %d rows to %s", len(df), csv_path.resolve())
-    logging.info("Tip: choose next tracks where BPM within ±2–4 and camelot_distance(current, candidate) <= 1.")
+    logging.info("Tip: export cues with export_hotcues_dual.py based on .djmeta.json files.")
+
+
+def process_local_directory(
+    localdir: Path,
+    csv_path: Optional[Path],
+    exts=(".wav", ".mp3", ".flac", ".aiff", ".aif"),
+) -> None:
+    logging.info("Scanning local directory: %s", localdir)
+    files = [p for p in sorted(localdir.glob("*")) if p.suffix.lower() in exts]
+    if not files:
+        logging.error("No audio files found in %s", localdir)
+        return
+
+    # Default CSV: in folder, name summary
+    if csv_path is None:
+        csv_path = localdir / "local_analysis.csv"
+
+    rows = []
+    for i, path in enumerate(files, 1):
+        logging.info("[LOCAL %d/%d] %s", i, len(files), path.name)
+        analysis = analyze_audio(path)
+        write_track_json(path, analysis)
+
+        rows.append({
+            "title": analysis.get("title") or path.stem,
+            "file_path": str(path),
+            "bpm": analysis.get("bpm"),
+            "camelot": analysis.get("camelot"),
+            "key_root": analysis.get("key_root"),
+            "mode": analysis.get("mode"),
+            "intro_end_s": analysis.get("intro_end_s"),
+            "outro_start_s": analysis.get("outro_start_s"),
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    logging.info("Saved %d rows to %s", len(df), csv_path.resolve())
+
 
 # -------------------------
 # CLI
 # -------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Analyze YouTube playlist (download+analyze) OR a local folder of audio files, and output DJ metadata."
-    )
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--playlist-url", help="YouTube playlist URL (enables yt-dlp playlist mode)")
-    src.add_argument("--localdir", help="Path to folder with existing audio files (analyzes WAV/MP3/… in place)")
-
-    p.add_argument("--outdir", default="downloads", help="[playlist mode] Directory to store audio files (default: downloads)")
-    p.add_argument("--csv", default=None, help="CSV output path. Default: <outdir>/<playlist-title>.csv (playlist) or <localdir>/local_analysis.csv (local)")
-    p.add_argument("--download", action="store_true", help="[playlist mode] Actually download audio. Omit to only list & CSV of URLs.")
-    p.add_argument("--codec", choices=["wav", "mp3"], default="wav", help="[playlist mode] Output audio codec (default: wav)")
-    p.add_argument("--mp3-bitrate", default="192", help="[playlist mode] MP3 bitrate kbps (only if --codec mp3). Default: 192")
-    p.add_argument("--browser", choices=["chrome", "firefox", "edge", "brave", "chromium"],
-                   help="[playlist mode] Use cookies from this browser (must be logged in).")
-    p.add_argument("--cookiefile", help="[playlist mode] Path to cookies.txt exported from your browser.")
-    p.add_argument("-v", "--verbose", action="count", default=1, help="Increase verbosity: -v (info, default), -vv (debug)")
+    p = argparse.ArgumentParser(description="YouTube playlist / local audio → rich DJ metadata (CSV + .djmeta.json)")
+    p.add_argument("--playlist", help="YouTube playlist URL (requires yt-dlp)")
+    p.add_argument("--outdir", default="downloads", help="Directory for downloads (and default CSV for playlist).")
+    p.add_argument("--csv", default=None, help="CSV output path. Default: for playlist → <outdir>/<playlist-title>.csv; for localdir → <localdir>/local_analysis.csv")
+    p.add_argument("--download", action="store_true", help="When used with --playlist, download audio (WAV/MP3).")
+    p.add_argument("--codec", choices=["wav", "mp3"], default="wav", help="Download codec (default: wav)")
+    p.add_argument("--mp3-bitrate", default="192", help="MP3 bitrate kbps (only if --codec mp3). Default: 192")
+    p.add_argument("--browser", choices=["chrome", "firefox", "edge", "brave", "chromium"], help="Use browser cookies for yt-dlp.")
+    p.add_argument("--cookiefile", help="Path to cookies.txt for yt-dlp.")
+    p.add_argument("--localdir", help="Analyze already-downloaded audio in this folder (no YouTube).")
+    p.add_argument("-v", "--verbose", action="count", default=1, help="Increase verbosity: -v (info), -vv (debug)")
     return p.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
     setup_logging(args.verbose)
 
-    if args.localdir:
-        process_local_folder(localdir=Path(args.localdir), csv_path=(Path(args.csv) if args.csv else None))
-    else:
+    if args.playlist:
         outdir = Path(args.outdir)
         process_playlist(
-            playlist_url=args.playlist_url,
+            playlist_url=args.playlist,
             outdir=outdir,
             csv_path=(Path(args.csv) if args.csv else None),
             download_audio=args.download,
@@ -741,3 +701,10 @@ if __name__ == "__main__":
             cookies_from_browser=args.browser,
             cookiefile=args.cookiefile,
         )
+    elif args.localdir:
+        process_local_directory(
+            localdir=Path(args.localdir),
+            csv_path=(Path(args.csv) if args.csv else None),
+        )
+    else:
+        logging.error("Nothing to do. Use --playlist ... or --localdir ...")
