@@ -39,7 +39,7 @@ def cmd_download_playlist(args):
         cookies_from_browser=args.browser,
         cookiefile=args.cookiefile,
     )
-    print(f"Saved {len(saved)} files in {Path(args.outdir).resolve()}")
+    print(f"Saved/verified {len(saved)} files in {Path(args.outdir).resolve()}")
 
 
 def cmd_analyze_local(args):
@@ -92,6 +92,7 @@ def cmd_analyze_playlist(args):
         logging.info("[PLAYLIST %d/%d] %s", i, len(items), item.get("title"))
         audio_path = None
         if args.download:
+            # NOTE: download_one() now skips if already exists
             audio_path = download_one(
                 item["url"], outdir=outdir, codec=args.codec, mp3_bitrate=args.mp3_bitrate,
                 cookies_from_browser=args.browser, cookiefile=args.cookiefile,
@@ -128,7 +129,7 @@ def parse_args():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # download-one
-    s = sub.add_parser("download-one", help="Download a single YouTube URL")
+    s = sub.add_parser("download-one", help="Download a single YouTube URL (skips if already exists)")
     s.add_argument("url", help="YouTube video URL")
     s.add_argument("--outdir", default="downloads")
     s.add_argument("--codec", choices=["wav","mp3"], default="wav")
@@ -138,7 +139,7 @@ def parse_args():
     s.set_defaults(func=cmd_download_one)
 
     # download-playlist
-    s = sub.add_parser("download-playlist", help="Download all audio from a playlist")
+    s = sub.add_parser("download-playlist", help="Download all audio from a playlist (skips existing)")
     s.add_argument("playlist", help="YouTube playlist URL")
     s.add_argument("--outdir", default="downloads")
     s.add_argument("--codec", choices=["wav","mp3"], default="wav")

@@ -3,13 +3,12 @@
 from __future__ import annotations
 import logging, json, traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import librosa
 from scipy.signal import find_peaks
 
-# optional
 try:
     import pyloudnorm as pyln
     HAS_LOUDNORM = True
@@ -17,7 +16,6 @@ except Exception:
     HAS_LOUDNORM = False
 
 
-# -------- utils --------
 def to_float(x) -> float:
     try:
         arr = np.asarray(x)
@@ -31,7 +29,7 @@ def r2(x) -> float:
     return round(to_float(x), 2)
 
 
-# -------- key / camelot --------
+# ---- key / camelot ----
 _PITCH_NAMES   = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 _CAMELOT_MAJOR = ["8B","3B","10B","5B","12B","7B","2B","9B","4B","11B","6B","1B"]
 _CAMELOT_MINOR = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"]
@@ -39,7 +37,6 @@ _CAMELOT_MINOR = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"
 def estimate_key_ks(y, sr):
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     chroma_mean = librosa.util.normalize(chroma.mean(axis=1), norm=1)
-
     maj_prof = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88], float)
     min_prof = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17], float)
     maj_prof /= maj_prof.sum(); min_prof /= min_prof.sum()
@@ -48,7 +45,6 @@ def estimate_key_ks(y, sr):
     for root in range(12):
         scores.append(("maj", root, float(np.dot(np.roll(maj_prof, root), chroma_mean))))
         scores.append(("min", root, float(np.dot(np.roll(min_prof, root), chroma_mean))))
-
     mode, root, _ = max(scores, key=lambda x: x[2])
     sorted_scores = sorted(scores, key=lambda x: x[2], reverse=True)
     conf = float(sorted_scores[0][2] - sorted_scores[1][2])
@@ -58,7 +54,7 @@ def estimate_key_ks(y, sr):
     return key_root, ("major" if mode=="maj" else "minor"), camelot, round(conf, 4)
 
 
-# -------- energy + loudness --------
+# ---- energy + loudness ----
 def energy_features(y, sr, include_curve: bool = False):
     hop = 1024
     frame_len = 2048
@@ -86,7 +82,7 @@ def estimate_lufs(y, sr) -> Optional[float]:
     return round(loudness, 2)
 
 
-# -------- downbeat / bars --------
+# ---- downbeat / bars ----
 def estimate_downbeat_offset(y, sr, beat_frames) -> int:
     if beat_frames is None or len(beat_frames) < 8:
         return 0
@@ -112,7 +108,7 @@ def bars_from_beats_with_offset(beat_times: np.ndarray, offset: int = 0) -> List
     return [round(t, 2) for t in out]
 
 
-# -------- vocal curve --------
+# ---- vocal curve ----
 def vocal_likelihood_curve(y, sr, include_curve=True):
     y_h, _ = librosa.effects.hpss(y)
     S = librosa.feature.melspectrogram(y=y_h, sr=sr, n_fft=2048, hop_length=512, n_mels=64)
@@ -122,7 +118,7 @@ def vocal_likelihood_curve(y, sr, include_curve=True):
     total_energy = np.maximum(S.sum(axis=0), 1e-8)
     raw = band_energy / total_energy
 
-    # light smoothing by moving average (no SciPy dependency)
+    # light smoothing (moving average)
     win = 5
     if len(raw) >= win:
         kernel = np.ones(win) / win
@@ -146,18 +142,7 @@ def vocal_likelihood_curve(y, sr, include_curve=True):
     return float(np.mean(vl)), times_ds.tolist(), vl_ds.tolist()
 
 
-def vocal_score_around(times: np.ndarray, values: np.ndarray, t: float, win: float = 4.0) -> float:
-    if times is None or values is None or len(times) == 0:
-        return 0.0
-    lo, hi = t - win/2, t + win/2
-    mask = (times >= lo) & (times <= hi)
-    if not np.any(mask):
-        idx = int(np.argmin(np.abs(times - t)))
-        return float(values[idx])
-    return float(np.mean(values[mask]))
-
-
-# -------- structure heuristics --------
+# ---- structure heuristics ----
 def structure_heuristics(y, sr, beat_times):
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     onset_times = librosa.times_like(onset_env, sr=sr)
@@ -198,7 +183,7 @@ def structure_heuristics(y, sr, beat_times):
     else:
         outro_start_s = float(beat_times[0]) if len(beat_times) else 0.0
 
-    # Breakdowns from energy local minima (~6s window)
+    # Breakdowns from local minima
     breakdowns = []
     if times_ds is not None and len(times_ds) > 2:
         dt = max(1e-6, to_float(times_ds[1]) - to_float(times_ds[0]))
@@ -246,7 +231,6 @@ def bar_starts_simple(beat_times, beats_per_bar=4):
     return [r2(float(beat_times[i])) for i in range(0, len(beat_times), beats_per_bar)]
 
 
-# -------- analyze one file --------
 def analyze_audio(path: Path) -> Dict[str, Any]:
     logging.info("Analyzing audio: %s", path)
     try:
@@ -271,9 +255,7 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
         LOW_VOCAL_THR = 0.4
         low_vocal_bar_starts = []
         for bt in bars_downbeat:
-            # quick local mean around each bar
             if vocal_t is not None and vocal_v is not None and len(vocal_t):
-                # nearest frame to bt
                 idx = int(np.argmin(np.abs(np.asarray(vocal_t) - bt)))
                 vs = float(vocal_v[idx])
             else:
