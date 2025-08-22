@@ -20,11 +20,6 @@ def ffmpeg_ok() -> bool:
     return ok
 
 
-def _ensure_yt_dlp():
-    if not HAS_YT_DLP:
-        raise RuntimeError("yt_dlp is not installed. pip install yt-dlp")
-
-
 def build_ydl_opts(
     outdir: Path,
     prefer_codec: str = "wav",
@@ -46,7 +41,7 @@ def build_ydl_opts(
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": prefer_codec,      # "wav" or "mp3"
-            "preferredquality": prefer_quality,  # "0" for wav; "192" for mp3, etc.
+            "preferredquality": prefer_quality,  # "0" for wav; "192" etc. for mp3
         }]
     if cookies_from_browser:
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
@@ -55,6 +50,11 @@ def build_ydl_opts(
         ydl_opts["cookiefile"] = cookiefile
         logging.info("Using cookiefile: %s", cookiefile)
     return ydl_opts
+
+
+def _ensure_yt_dlp():
+    if not HAS_YT_DLP:
+        raise RuntimeError("yt_dlp is not installed. pip install yt-dlp")
 
 
 def create_ydl(
@@ -104,24 +104,6 @@ def list_playlist(playlist_url: str, ydl_list) -> Tuple[List[Dict], str]:
         return [], "playlist"
 
 
-def _fetch_title(video_url: str) -> Optional[str]:
-    """Lightweight info probe to get the title (for filename prediction)."""
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-        title = (info.get("title") or "track").replace("/", "-")
-        return title
-    except Exception as e:
-        logging.warning("Could not prefetch title for %s: %s", video_url, e)
-        return None
-
-
-def _expected_path(outdir: Path, title: Optional[str], codec: str) -> Optional[Path]:
-    if not title:
-        return None
-    return outdir / f"{title}.{codec}"
-
-
 def download_one(
     video_url: str,
     outdir: Path,
@@ -130,22 +112,10 @@ def download_one(
     cookies_from_browser: Optional[str] = None,
     cookiefile: Optional[str] = None,
 ) -> Optional[Path]:
-    """
-    Download one track and convert to target codec.
-    Skip if the expected file already exists.
-    Returns final file path or None.
-    """
+    """Download one track and convert to target codec. Returns final file path or None."""
     _ensure_yt_dlp()
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # Predict filename; if present, skip
-    title = _fetch_title(video_url)
-    expected = _expected_path(outdir, title, codec)
-    if expected and expected.exists():
-        logging.info("Already downloaded, skipping: %s", expected)
-        return expected
-
     logging.info("Downloading %s from: %s", codec.upper(), video_url)
+    outdir.mkdir(parents=True, exist_ok=True)
     if not ffmpeg_ok():
         logging.warning("FFmpeg is required to convert to %s. Attempting anyway; may fail.", codec.upper())
 
@@ -155,8 +125,6 @@ def download_one(
     )
     try:
         info = ydl_dl.extract_info(video_url, download=True)
-
-        # Try requested_downloads (newer yt-dlp)
         candidate = None
         try:
             reqs = info.get("requested_downloads") or []
@@ -164,17 +132,12 @@ def download_one(
                 candidate = Path(reqs[0]["filepath"])
         except Exception:
             pass
-
-        # Fallback: inferred by title
         if not candidate:
-            if not title:
-                title = (info.get("title") or "track").replace("/", "-")
-            candidate = outdir / f"{title}.{codec}"
-
-        if candidate.exists():
+            title = (info.get("title") or "track").replace("/", "-")
+            candidate = next((p for p in outdir.glob(f"{title}.{codec}")), None)
+        if candidate and candidate.exists():
             logging.info("Saved %s: %s", codec.upper(), candidate)
             return candidate
-
         logging.warning("Could not locate downloaded %s file for: %s", codec.upper(), video_url)
         return None
     except Exception as e:
@@ -191,10 +154,7 @@ def download_playlist(
     cookies_from_browser: Optional[str] = None,
     cookiefile: Optional[str] = None,
 ) -> List[Path]:
-    """
-    Download all tracks in a playlist, skipping files already present.
-    Returns list of file paths that were saved or already existed.
-    """
+    """Download all tracks in a playlist. Returns list of file paths that were saved."""
     _ensure_yt_dlp()
     ydl_list = create_ydl(
         listing=True, outdir=Path("."), codec=codec, mp3_bitrate=mp3_bitrate,
@@ -206,18 +166,9 @@ def download_playlist(
 
     saved: List[Path] = []
     for i, item in enumerate(items, 1):
-        url = item["url"]
-        title = (item.get("title") or "track").replace("/", "-")
-        expected = _expected_path(outdir, title, codec)
-
-        if expected and expected.exists():
-            logging.info("[SKIP %d/%d] Already exists: %s", i, len(items), expected.name)
-            saved.append(expected)
-            continue
-
-        logging.info("[DL %d/%d] %s", i, len(items), title)
+        logging.info("[PLAYLIST %d/%d] %s", i, len(items), item.get("title"))
         p = download_one(
-            url, outdir=outdir, codec=codec, mp3_bitrate=mp3_bitrate,
+            item["url"], outdir=outdir, codec=codec, mp3_bitrate=mp3_bitrate,
             cookies_from_browser=cookies_from_browser, cookiefile=cookiefile,
         )
         if p:
