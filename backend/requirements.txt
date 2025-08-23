@@ -1,2 +1,8 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+yt-dlp
+pandas
+matplotlib
+numpy>=1.23
+matplotlib>=3.7
+librosa>=0.10
+scipy>=1.10
+pyloudnorm>=0.1%
