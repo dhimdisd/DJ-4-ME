@@ -111,7 +111,7 @@ def download_one(
     mp3_bitrate: str = "192",
     cookies_from_browser: Optional[str] = None,
     cookiefile: Optional[str] = None,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], Optional[Dict[str, Any]]]:
     """Download one track and convert to target codec. Returns final file path or None."""
     _ensure_yt_dlp()
     logging.info("Downloading %s from: %s", codec.upper(), video_url)
@@ -137,15 +137,13 @@ def download_one(
             candidate = next((p for p in outdir.glob(f"{title}.{codec}")), None)
         if candidate and candidate.exists():
             logging.info("Saved %s: %s", codec.upper(), candidate)
-            return candidate
+            return candidate, info
         logging.warning("Could not locate downloaded %s file for: %s", codec.upper(), video_url)
-        return None
+        return None, None
     except Exception as e:
         logging.error("%s download failed for %s: %s", codec.upper(), video_url, e)
         traceback.print_exc()
-        return None
-
-
+        return None, None
 def download_playlist(
     playlist_url: str,
     outdir: Path,

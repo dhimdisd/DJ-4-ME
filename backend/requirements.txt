@@ -5,4 +5,6 @@ numpy>=1.23
 matplotlib>=3.7
 librosa>=0.10
 scipy>=1.10
-pyloudnorm>=0.1%
+pyloudnorm>=0.1
+# Optional (for MP3 tagging we added)
+mutagen==1.47.0

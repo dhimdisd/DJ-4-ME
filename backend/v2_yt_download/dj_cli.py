@@ -10,6 +10,28 @@ from downloader import (
 )
 from dj_analyzer import analyze_audio, write_track_json
 
+# --- optional tagging deps (for setting MP3 genre) ---
+try:
+    from mutagen.easyid3 import EasyID3  # type: ignore
+    from mutagen.id3 import ID3, ID3NoHeaderError  # type: ignore
+    HAS_MUTAGEN = True
+except Exception:
+    HAS_MUTAGEN = False
+
+def _set_mp3_genre(path: Path, genre: str):
+    if not HAS_MUTAGEN or not genre:
+        return
+    try:
+        try:
+            tags = EasyID3(str(path))
+        except ID3NoHeaderError:
+            tags = EasyID3()
+        tags["genre"] = genre
+        tags.save(str(path))
+    except Exception as e:
+        logging.warning("Failed to set MP3 genre for %s: %s", path, e)
+
+
 
 def setup_logging(verbosity: int = 1):
     level = logging.INFO if verbosity == 1 else (logging.DEBUG if verbosity >= 2 else logging.WARNING)
@@ -18,7 +40,7 @@ def setup_logging(verbosity: int = 1):
 
 # ---- commands ----
 def cmd_download_one(args):
-    out = download_one(
+    out, _info = download_one(
         video_url=args.url,
         outdir=Path(args.outdir),
         codec=args.codec,
@@ -92,12 +114,28 @@ def cmd_analyze_playlist(args):
         logging.info("[PLAYLIST %d/%d] %s", i, len(items), item.get("title"))
         audio_path = None
         if args.download:
-            audio_path = download_one(
+            audio_path, info = download_one(
                 item["url"], outdir=outdir, codec=args.codec, mp3_bitrate=args.mp3_bitrate,
                 cookies_from_browser=args.browser, cookiefile=args.cookiefile,
             )
         if audio_path and audio_path.exists():
             meta = analyze_audio(audio_path)
+            # --- attach source-derived genre/tags ---
+            source_tags = (info or {}).get('tags') or []
+            categories  = (info or {}).get('categories') or []
+            genre_guess = (info or {}).get('genre') or (categories[0] if categories else None)
+            meta.update({
+                'source_tags': source_tags,
+                'source_categories': categories,
+                'genre_guess': genre_guess,
+                'source_channel': (info or {}).get('channel'),
+                'source_uploader': (info or {}).get('uploader'),
+            })
+            # set MP3 genre tag if applicable
+            if genre_guess and str(audio_path).lower().endswith('.mp3'):
+                _set_mp3_genre(audio_path, genre_guess)
+
+            # (genre block cleaned)
             write_track_json(audio_path, meta)
         else:
             meta = {"title": item.get("title"), "bpm": None, "camelot": None, "key_root": None, "mode": None,
