@@ -9,6 +9,25 @@ import numpy as np
 import librosa
 from scipy.signal import find_peaks
 
+def _time_to_index(t: float, starts: List[float]) -> Optional[int]:
+    """Return 1-based index of the segment whose start <= t < next_start.
+    If t is before the first start, return 1. If list is empty, None.
+    """
+    try:
+        if not starts:
+            return None
+        # ensure sorted numeric
+        xs = [float(x) for x in starts]
+        idx = 1
+        for i, s in enumerate(xs):
+            if t >= s:
+                idx = i + 1
+            else:
+                break
+        return idx
+    except Exception:
+        return None
+
 # optional
 try:
     import pyloudnorm as pyln
@@ -283,6 +302,26 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
 
         mix_in_time = phrases[1] if len(phrases) > 1 else (beat_times[32] if len(beat_times) > 32 else 0.0)
         mix_out_time = struct["outro_start_s"]
+        # compute bar/phrase indices for key markers (1-based)
+        mix_in_bar  = _time_to_index(float(mix_in_time), bars_downbeat) or _time_to_index(float(mix_in_time), bars_simple) or None
+        mix_out_bar = _time_to_index(float(mix_out_time), bars_downbeat) or _time_to_index(float(mix_out_time), bars_simple) or None
+        intro_end_bar   = _time_to_index(float(struct["intro_end_s"]), bars_downbeat) if struct.get("intro_end_s") is not None else None
+        outro_start_bar = _time_to_index(float(struct["outro_start_s"]), bars_downbeat) if struct.get("outro_start_s") is not None else None
+        mix_in_phrase_index  = _time_to_index(float(mix_in_time), phrases) if phrases else None
+        mix_out_phrase_index = _time_to_index(float(mix_out_time), phrases) if phrases else None
+
+        
+        # --- Added: bar/phrase index arrays for compact, beat-based navigation ---
+        bar_starts_s_out = bars_simple[:200]
+        bar_starts_bars = list(range(1, len(bar_starts_s_out) + 1))
+
+        phrase_s_out = phrases[:50] if phrases else []
+        phrase_boundaries_bars = []
+        if phrase_s_out:
+            for p in phrase_s_out:
+                idx = _time_to_index(float(p), bars_downbeat) or _time_to_index(float(p), bars_simple) or None
+                phrase_boundaries_bars.append(idx)
+        phrase_boundaries_phrases = list(range(1, len(phrase_s_out) + 1))
 
         lufs = estimate_lufs(y, sr)
 
@@ -297,10 +336,19 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
             "key_confidence": key_conf,
             "mix_in_time_s": r2(mix_in_time),
             "mix_out_time_s": r2(mix_out_time),
+            "mix_in_bar": mix_in_bar,
+            "mix_out_bar": mix_out_bar,
+            "intro_end_bar": intro_end_bar,
+            "outro_start_bar": outro_start_bar,
+            "mix_in_phrase_index": mix_in_phrase_index,
+            "mix_out_phrase_index": mix_out_phrase_index,
             "intro_end_s": struct["intro_end_s"],
             "outro_start_s": struct["outro_start_s"],
-            "phrase_boundaries_s": phrases[:50],
-            "bar_starts_s": bars_simple[:200],
+            "phrase_boundaries_s": phrase_s_out,
+            "phrase_boundaries_bars": phrase_boundaries_bars,
+            "phrase_boundaries_phrases": phrase_boundaries_phrases,
+            "bar_starts_s": bar_starts_s_out,
+            "bar_starts_bars": bar_starts_bars,
             "downbeat_offset": int(downbeat_offset),
             "bar1_time_s": r2(bar1_time_s),
             "downbeat_bar_starts_s": bars_downbeat[:200],
@@ -326,7 +374,7 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
             "title": path.stem,
             "bpm": None, "beats_count": None, "bars_count": None,
             "key_root": None, "mode": None, "camelot": None, "key_confidence": None,
-            "mix_in_time_s": None, "mix_out_time_s": None,
+            "mix_in_time_s": None, "mix_out_time_s": None, "mix_in_bar": None, "mix_out_bar": None, "intro_end_bar": None, "outro_start_bar": None, "mix_in_phrase_index": None, "mix_out_phrase_index": None,
             "intro_end_s": None, "outro_start_s": None,
             "phrase_boundaries_s": [], "bar_starts_s": [], "downbeat_bar_starts_s": [],
             "downbeat_offset": None, "bar1_time_s": None, "low_vocal_bar_starts_s": [],
@@ -341,7 +389,7 @@ def write_track_json(audio_path: Path, analysis: Dict[str, Any]):
     meta_path = audio_path.with_suffix("").with_suffix(".djmeta.json")
     try:
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(analysis, f, ensure_ascii=False, indent=2)
+            json.dump(analysis, f, ensure_ascii=False, indent=2, separators=(",", ": "))
         logging.info("Wrote metadata JSON: %s", meta_path)
     except Exception as e:
         logging.warning("Failed to write track JSON for %s: %s", audio_path, e)
