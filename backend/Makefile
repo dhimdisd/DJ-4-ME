@@ -49,6 +49,21 @@ else
   endif
 endif
 
+## Auto-detect (playlist or single) from ID or URL
+## Examples:
+##   make download INPUT=PLEguQ1EpXp3Tb1g6xosTsBRVmAV-fBq6d          # playlist ID
+##   make download INPUT=WyM4pZC1h1o                                  # video ID
+##   make download INPUT="https://music.youtube.com/playlist?list=..." # playlist URL
+##   make download INPUT="https://www.youtube.com/watch?v=..."         # video URL
+download:
+	cd $(BACKEND_DIR) && \
+	python dj_cli.py download "$(INPUT)" \
+	  --site $(TRACK_SITE) \
+	  --outdir downloads/audio \
+	  --codec $(CODEC) \
+	  --mp3-bitrate $(MP3_BR) \
+	  $(DL_FLAGS)
+
 # ====== Targets ======
 
 ## Download a playlist by ID or URL
@@ -105,3 +120,50 @@ clean-playlists:
 ## Nuke audio, metadata, and playlist symlinks (careful!)
 clean:
 	rm -rf $(OUTDIR)/* $(METADATA_DIR)/* $(PLAYLISTS_ROOT)/*
+
+
+AUDIO_DIR := v2_yt_download/downloads/audio
+
+# Delete a single track by TITLE or by PATH
+# Usage:
+#   make delete-track TITLE="No Broke Boys"
+#   make delete-track PATH="v2_yt_download/downloads/audio/No Broke Boys.mp3"
+delete-track:
+	@if [ -n "$(TITLE)" ]; then \
+	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$TITLE"; \
+	elif [ -n "$(PATH)" ]; then \
+	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$PATH"; \
+	else \
+	  echo "Usage: make delete-track TITLE='Exact Title'  OR  make delete-track PATH='path/to/file.mp3'"; \
+	  exit 1; \
+	fi
+
+# Delete an entire playlist by its title (as recorded in ledger)
+# Usage:
+#   make delete-playlist TITLE="Afro House 2025"
+delete-playlist:
+	@if [ -z "$(TITLE)" ]; then \
+	  echo "Usage: make delete-playlist TITLE='Playlist Title'"; exit 1; \
+	fi
+	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-playlist "$(TITLE)"
+
+# Dry-run wrappers (preview only)
+delete-track-dry:
+	@if [ -n "$(TITLE)" ]; then \
+	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$TITLE"; \
+	elif [ -n "$(PATH)" ]; then \
+	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$PATH"; \
+	else \
+	  echo "Usage: make delete-track-dry TITLE='Exact Title'  OR  make delete-track-dry PATH='path/to/file.mp3'"; \
+	  exit 1; \
+	fi
+
+delete-playlist-dry:
+	@if [ -z "$(TITLE)" ]; then \
+	  echo "Usage: make delete-playlist-dry TITLE='Playlist Title'"; exit 1; \
+	fi
+	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-playlist "$(TITLE)"
+
+# Clean orphans: broken symlinks + ledger rows pointing to missing files
+clean-orphans:
+	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) clean-orphans

@@ -5,6 +5,9 @@ import argparse, logging
 from pathlib import Path
 import pandas as pd
 
+import re
+from urllib.parse import urlparse, parse_qs
+
 from downloader import (
     create_ydl, list_playlist, download_one, download_playlist
 )
@@ -17,6 +20,42 @@ try:
     HAS_MUTAGEN = True
 except Exception:
     HAS_MUTAGEN = False
+
+
+YT_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def _looks_like_playlist_id(s: str) -> bool:
+    # Common playlist ID prefixes (PL..., RD..., OLAK..., etc)
+    return s.startswith(("PL", "RD", "OLAK", "VLPL", "UU", "LL", "FL"))
+
+def _is_url(s: str) -> bool:
+    return s.startswith("http://") or s.startswith("https://")
+
+def _url_has_list_param(url: str) -> bool:
+    try:
+        q = parse_qs(urlparse(url).query)
+        return "list" in q
+    except Exception:
+        return False
+
+def _normalize_to_url(arg: str, site: str = "youtube", treat_as_playlist: bool | None = None) -> str:
+    """Turn an ID or URL into a canonical URL. If treat_as_playlist is None, just build /watch?v=... for video IDs."""
+    if _is_url(arg):
+        return arg
+    # ID
+    if treat_as_playlist is True or (treat_as_playlist is None and _looks_like_playlist_id(arg)):
+        return f"https://{'music.' if site=='music' else ''}youtube.com/playlist?list={arg}"
+    # else assume video id
+    return f"https://{'music.' if site=='music' else ''}youtube.com/watch?v={arg}"
+
+def _probe_is_playlist(url: str, *, codec: str, browser: str | None, cookiefile: str | None) -> bool:
+    """Ask yt-dlp (flat) whether this is a playlist (has entries) or a single."""
+    ydl = create_ydl(
+        listing=True, outdir=Path("."), codec=codec, mp3_bitrate="192",
+        cookies_from_browser=browser, cookiefile=cookiefile
+    )
+    info = ydl.extract_info(url, download=False)
+    return bool(info and info.get("entries"))
 
 def _set_mp3_genre(path: Path, genre: str):
     if not HAS_MUTAGEN or not genre:
@@ -157,6 +196,66 @@ def cmd_analyze_playlist(args):
     pd.DataFrame(rows).to_csv(out_csv, index=False)
     print(f"Wrote {len(rows)} rows → {out_csv.resolve()}")
 
+def cmd_download_auto(args):
+    # Decide playlist vs single based on the arg content / probe
+    inp = args.input.strip()
+    site = args.site  # "music" or "youtube"
+    # Quick heuristics first:
+    if _is_url(inp):
+        if _url_has_list_param(inp):
+            is_playlist = True
+            url = inp
+        else:
+            # Probe (could be a video URL or a playlist URL without ?list)
+            url = inp
+            is_playlist = _probe_is_playlist(
+                url, codec=args.codec,
+                browser=args.browser, cookiefile=args.cookiefile
+            )
+    else:
+        # It's an ID: guess from shape, otherwise probe
+        if _looks_like_playlist_id(inp):
+            is_playlist = True
+            url = _normalize_to_url(inp, site=site, treat_as_playlist=True)
+        elif YT_VIDEO_ID_RE.match(inp):
+            is_playlist = False
+            url = _normalize_to_url(inp, site=site, treat_as_playlist=False)
+        else:
+            # Fallback: assume video, then probe
+            url_guess = _normalize_to_url(inp, site=site, treat_as_playlist=False)
+            is_playlist = _probe_is_playlist(
+                url_guess, codec=args.codec,
+                browser=args.browser, cookiefile=args.cookiefile
+            )
+            url = url_guess
+
+    # Dispatch to existing commands
+    if is_playlist:
+        # Reuse your existing playlist handler
+        class P: pass
+        p = P()
+        p.playlist = url
+        p.outdir = args.outdir
+        p.codec = args.codec
+        p.mp3_bitrate = args.mp3_bitrate
+        p.browser = args.browser
+        p.cookiefile = args.cookiefile
+        p.force = args.force
+        p.no_archive = args.no_archive
+        cmd_download_playlist(p)
+    else:
+        class O: pass
+        o = O()
+        o.url = url
+        o.outdir = args.outdir
+        o.codec = args.codec
+        o.mp3_bitrate = args.mp3_bitrate
+        o.browser = args.browser
+        o.cookiefile = args.cookiefile
+        o.force = args.force
+        o.no_archive = args.no_archive
+        cmd_download_one(o)
+
 
 # ---- CLI ----
 def parse_args():
@@ -185,6 +284,19 @@ def parse_args():
     s.add_argument("--cookiefile")
     s.set_defaults(func=cmd_download_playlist)
 
+    # download-playlist or song
+    s = sub.add_parser("download", help="Auto-detect playlist or single from ID/URL and download")
+    s.add_argument("input", help="Playlist ID/URL or Video ID/URL")
+    s.add_argument("--site", choices=["music","youtube"], default="youtube", help="Interpret bare IDs for this site")
+    s.add_argument("--outdir", required=True)
+    s.add_argument("--codec", default="mp3")
+    s.add_argument("--mp3-bitrate", default="320")
+    s.add_argument("--browser")
+    s.add_argument("--cookiefile")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--no-archive", action="store_true")
+    s.set_defaults(func=cmd_download_auto)
+
     # analyze-local
     s = sub.add_parser("analyze-local", help="Analyze already-downloaded audio in a folder")
     s.add_argument("localdir", help="Folder with audio files")
@@ -203,6 +315,8 @@ def parse_args():
     s.add_argument("--browser", choices=["chrome","firefox","edge","brave","chromium"])
     s.add_argument("--cookiefile")
     s.set_defaults(func=cmd_analyze_playlist)
+
+
 
     return ap.parse_args()
 
