@@ -3,11 +3,13 @@
 from __future__ import annotations
 import logging, json, traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import librosa
 from scipy.signal import find_peaks
+
+# ----------------------------- helpers -------------------------------------
 
 def _time_to_index(t: float, starts: List[float]) -> Optional[int]:
     """Return 1-based index of the segment whose start <= t < next_start.
@@ -28,7 +30,7 @@ def _time_to_index(t: float, starts: List[float]) -> Optional[int]:
     except Exception:
         return None
 
-# optional
+# optional loudness
 try:
     import pyloudnorm as pyln
     HAS_LOUDNORM = True
@@ -36,24 +38,81 @@ except Exception:
     HAS_LOUDNORM = False
 
 
-# -------- utils --------
 def to_float(x) -> float:
     try:
         arr = np.asarray(x)
-        if arr.ndim == 0: return float(arr.item())
+        if arr.ndim == 0:
+            return float(arr.item())
         return float(arr.flat[0])
     except Exception:
-        try: return float(x)
-        except Exception: return 0.0
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
 
 def r2(x) -> float:
     return round(to_float(x), 2)
 
 
+# --- Cues generator ---------------------------------------------------------
+
+def _mk_cue(label: str, time_s: float | None = None, bar: int | None = None,
+            color: str = "blue", ctype: str = "marker") -> Dict[str, Any]:
+    cue: Dict[str, Any] = {"label": label, "color": color, "type": ctype}
+    if time_s is not None:
+        cue["time_s"] = round(float(time_s), 3)
+    if bar is not None:
+        cue["bar"] = int(bar)
+    return cue
+
+
+def cues_from_meta(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build a compact list of DJ-friendly cue suggestions.
+    Prefers bar indices when available, falls back to seconds.
+    """
+    cues: List[Dict[str, Any]] = []
+
+    # Intro start (bar 1)
+    bar1_time = meta.get("bar1_time_s", meta.get("downbeat_time_s"))
+    if bar1_time is None:
+        bs = meta.get("bar_starts_s") or []
+        bar1_time = bs[0] if bs else 0.0
+    bar1_idx = 1
+    cues.append(_mk_cue("Intro Start", time_s=bar1_time, bar=bar1_idx, color="cyan"))
+
+    # Mix In / Mix Out
+    cues.append(_mk_cue("Mix In",  time_s=meta.get("mix_in_time_s"),  bar=meta.get("mix_in_bar"),  color="green"))
+    cues.append(_mk_cue("Mix Out", time_s=meta.get("mix_out_time_s"), bar=meta.get("mix_out_bar"), color="yellow"))
+
+    # Drops & Breakdowns (first occurrences)
+    drops = meta.get("drops_s") or []
+    bdowns = meta.get("breakdowns_s") or []
+    if drops:
+        cues.append(_mk_cue("Drop 1", time_s=drops[0], color="red"))
+    if bdowns:
+        cues.append(_mk_cue("Breakdown 1", time_s=bdowns[0], color="purple"))
+
+    # Outro start
+    cues.append(_mk_cue("Outro Start", time_s=meta.get("outro_start_s"), bar=meta.get("outro_start_bar"), color="orange"))
+
+    # De-dup, keep order
+    dedup: List[Dict[str, Any]] = []
+    seen: set[tuple] = set()
+    for c in cues:
+        key = (c.get("label"), c.get("time_s"), c.get("bar"))
+        if any(v is not None for v in key) and key not in seen:
+            dedup.append(c)
+            seen.add(key)
+    return dedup
+
+# ---------------------------------------------------------------------------
+
 # -------- key / camelot --------
 _PITCH_NAMES   = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 _CAMELOT_MAJOR = ["8B","3B","10B","5B","12B","7B","2B","9B","4B","11B","6B","1B"]
 _CAMELOT_MINOR = ["5A","12A","7A","2A","9A","4A","11A","6A","1A","8A","3A","10A"]
+
 
 def estimate_key_ks(y, sr):
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
@@ -78,6 +137,7 @@ def estimate_key_ks(y, sr):
 
 
 # -------- energy + loudness --------
+
 def energy_features(y, sr, include_curve: bool = False):
     hop = 1024
     frame_len = 2048
@@ -106,6 +166,7 @@ def estimate_lufs(y, sr) -> Optional[float]:
 
 
 # -------- downbeat / bars --------
+
 def estimate_downbeat_offset(y, sr, beat_frames) -> int:
     if beat_frames is None or len(beat_frames) < 8:
         return 0
@@ -128,10 +189,11 @@ def bars_from_beats_with_offset(beat_times: np.ndarray, offset: int = 0) -> List
     out = []
     for i in range(offset, len(beat_times), 4):
         out.append(float(beat_times[i]))
-    return [round(t, 2) for t in out]
+    return [r2(t) for t in out]
 
 
 # -------- vocal curve --------
+
 def vocal_likelihood_curve(y, sr, include_curve=True):
     y_h, _ = librosa.effects.hpss(y)
     S = librosa.feature.melspectrogram(y=y_h, sr=sr, n_fft=2048, hop_length=512, n_mels=64)
@@ -177,6 +239,7 @@ def vocal_score_around(times: np.ndarray, values: np.ndarray, t: float, win: flo
 
 
 # -------- structure heuristics --------
+
 def structure_heuristics(y, sr, beat_times):
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     onset_times = librosa.times_like(onset_env, sr=sr)
@@ -218,7 +281,7 @@ def structure_heuristics(y, sr, beat_times):
         outro_start_s = float(beat_times[0]) if len(beat_times) else 0.0
 
     # Breakdowns from energy local minima (~6s window)
-    breakdowns = []
+    breakdowns: List[float] = []
     if times_ds is not None and len(times_ds) > 2:
         dt = max(1e-6, to_float(times_ds[1]) - to_float(times_ds[0]))
         win = max(1, int(6.0 / dt))
@@ -229,7 +292,7 @@ def structure_heuristics(y, sr, beat_times):
                 breakdowns.append(to_float(times_ds[i]))
 
     # Drops: strong onsets shortly after breakdowns
-    drops = []
+    drops: List[float] = []
     if onset_peaks_s and breakdowns:
         b_iter = iter(breakdowns)
         b = next(b_iter, None)
@@ -261,11 +324,13 @@ def phrase_markers(beat_times, beats_per_bar=4, bars_per_phrase=8):
     phrase = beats_per_bar * bars_per_phrase  # 32
     return [r2(float(beat_times[i])) for i in range(0, len(beat_times), phrase)]
 
+
 def bar_starts_simple(beat_times, beats_per_bar=4):
     return [r2(float(beat_times[i])) for i in range(0, len(beat_times), beats_per_bar)]
 
 
 # -------- analyze one file --------
+
 def analyze_audio(path: Path) -> Dict[str, Any]:
     logging.info("Analyzing audio: %s", path)
     try:
@@ -288,7 +353,7 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
 
         vocal_mean, vocal_t, vocal_v = vocal_likelihood_curve(y, sr, include_curve=True)
         LOW_VOCAL_THR = 0.4
-        low_vocal_bar_starts = []
+        low_vocal_bar_starts: List[float] = []
         for bt in bars_downbeat:
             # quick local mean around each bar
             if vocal_t is not None and vocal_v is not None and len(vocal_t):
@@ -310,13 +375,12 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
         mix_in_phrase_index  = _time_to_index(float(mix_in_time), phrases) if phrases else None
         mix_out_phrase_index = _time_to_index(float(mix_out_time), phrases) if phrases else None
 
-        
         # --- Added: bar/phrase index arrays for compact, beat-based navigation ---
         bar_starts_s_out = bars_simple[:200]
         bar_starts_bars = list(range(1, len(bar_starts_s_out) + 1))
 
         phrase_s_out = phrases[:50] if phrases else []
-        phrase_boundaries_bars = []
+        phrase_boundaries_bars: List[Optional[int]] = []
         if phrase_s_out:
             for p in phrase_s_out:
                 idx = _time_to_index(float(p), bars_downbeat) or _time_to_index(float(p), bars_simple) or None
@@ -325,7 +389,7 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
 
         lufs = estimate_lufs(y, sr)
 
-        return {
+        out: Dict[str, Any] = {
             "title": path.stem,
             "bpm": r2(bpm),
             "beats_count": int(len(beat_times)),
@@ -357,15 +421,19 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
             "breakdowns_s": struct["breakdowns_s"],
             "drops_s": struct["drops_s"],
             "rms_db_mean": struct["rms_db_mean"],
-            "rms_db_std": struct["rms_db_std"],
+            "rms_db_std":  struct["rms_db_std"],
             "lufs_integrated": lufs,
             "energy_curve_sample": struct["energy_curve"],
             "vocal_mean": round(float(vocal_mean), 3),
             "vocal_curve_sample": {
                 "times_s": [r2(t) for t in (vocal_t or [])][:600],
                 "values":  [round(float(v),3) for v in (vocal_v or [])][:600],
-            }
+            },
         }
+
+        # Add DJ cues synthesized from analysis
+        out["cues"] = cues_from_meta(out)
+        return out
 
     except Exception as e:
         logging.error("Analysis failed for %s: %s", path, e)
@@ -374,7 +442,9 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
             "title": path.stem,
             "bpm": None, "beats_count": None, "bars_count": None,
             "key_root": None, "mode": None, "camelot": None, "key_confidence": None,
-            "mix_in_time_s": None, "mix_out_time_s": None, "mix_in_bar": None, "mix_out_bar": None, "intro_end_bar": None, "outro_start_bar": None, "mix_in_phrase_index": None, "mix_out_phrase_index": None,
+            "mix_in_time_s": None, "mix_out_time_s": None, "mix_in_bar": None, "mix_out_bar": None,
+            "intro_end_bar": None, "outro_start_bar": None,
+            "mix_in_phrase_index": None, "mix_out_phrase_index": None,
             "intro_end_s": None, "outro_start_s": None,
             "phrase_boundaries_s": [], "bar_starts_s": [], "downbeat_bar_starts_s": [],
             "downbeat_offset": None, "bar1_time_s": None, "low_vocal_bar_starts_s": [],
@@ -382,6 +452,7 @@ def analyze_audio(path: Path) -> Dict[str, Any]:
             "rms_db_mean": None, "rms_db_std": None, "lufs_integrated": None,
             "energy_curve_sample": {"times_s": [], "rms_db": []},
             "vocal_mean": None, "vocal_curve_sample": {"times_s": [], "values": []},
+            "cues": [],
         }
 
 
@@ -389,6 +460,7 @@ def write_track_json(audio_path: Path, analysis: Dict[str, Any]):
     meta_path = audio_path.with_suffix("").with_suffix(".djmeta.json")
     try:
         with open(meta_path, "w", encoding="utf-8") as f:
+            # compact arrays on one line but keep 2-space indentation for readability
             json.dump(analysis, f, ensure_ascii=False, indent=2, separators=(",", ": "))
         logging.info("Wrote metadata JSON: %s", meta_path)
     except Exception as e:
