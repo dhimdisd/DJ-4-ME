@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging, shutil, traceback, csv, datetime, os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import os, json, datetime
 
 try:
     import yt_dlp
@@ -43,7 +44,7 @@ def build_ydl_opts(
     }
 
     if not force:
-        ydl_opts["download_archive"] = str(outdir / "_download_archive.txt")
+        ydl_opts["download_archive"] = str(outdir.parent / "_download_archive.txt")
         ydl_opts["overwrites"] = False
     else:
         # Equivalent to --no-download-archive + --force-overwrites
@@ -252,12 +253,14 @@ def create_ydl(
     return yt_dlp.YoutubeDL(opts)
 
 
-def list_playlist(playlist_url: str, ydl_list) -> Tuple[List[Dict], str]:
+def list_playlist(playlist_url: str, ydl_list) -> Tuple[List[Dict], str, str]:
+    """Return (entries, playlist_title, playlist_id) with flat items: title, url, id, duration."""
     logging.info("Fetching playlist: %s", playlist_url)
     try:
         info = ydl_list.extract_info(playlist_url, download=False)
         entries = info.get("entries", []) or []
         playlist_title = info.get("title") or "playlist"
+        playlist_id = info.get("id") or ""   # <— add this
         logging.info("Found %d videos in playlist: %s", len(entries), playlist_title)
         flat = []
         for e in entries:
@@ -270,11 +273,11 @@ def list_playlist(playlist_url: str, ydl_list) -> Tuple[List[Dict], str]:
                 "url": f"https://www.youtube.com/watch?v={vid}" if vid else None,
                 "duration": e.get("duration"),
             })
-        return [x for x in flat if x.get("url")], playlist_title
+        return [x for x in flat if x.get("url")], playlist_title, playlist_id
     except Exception as e:
         logging.error("Failed to fetch playlist: %s", e)
         traceback.print_exc()
-        return [], "playlist"
+        return [], "playlist", ""
 
 
 # ----------------------------
@@ -297,7 +300,7 @@ def download_one_with_ydl(
 
     # Probe metadata (same cookies)
     ydl_list = get_shared_ydl(
-        listing=True, outdir=Path("."), codec=codec, mp3_bitrate="192",
+        listing=True, outdir=Path("."), codec=codec, mp3_bitrate="320",
         cookies_from_browser=cookies_from_browser, cookiefile=cookiefile, force=force,
     )
     try:
@@ -355,7 +358,7 @@ def download_one(
     video_url: str,
     outdir: Path,
     codec: str = "wav",
-    mp3_bitrate: str = "192",
+    mp3_bitrate: str = "320",
     cookies_from_browser: Optional[str] = None,
     cookiefile: Optional[str] = None,
     force: bool = False,
@@ -407,40 +410,75 @@ def download_playlist(
     playlist_url: str,
     outdir: Path,
     codec: str = "wav",
-    mp3_bitrate: str = "192",
+    mp3_bitrate: str = "320",
     cookies_from_browser: Optional[str] = None,
     cookiefile: Optional[str] = None,
-    force: bool = False,
 ) -> List[Path]:
     _ensure_yt_dlp()
-    # One shared YDL for listing, one for all downloads
     ydl_list = get_shared_ydl(
         listing=True, outdir=Path("."), codec=codec, mp3_bitrate=mp3_bitrate,
-        cookies_from_browser=cookies_from_browser, cookiefile=cookiefile, force=force,
+        cookies_from_browser=cookies_from_browser, cookiefile=cookiefile,
     )
-    items, playlist_title = list_playlist(playlist_url, ydl_list)
+    items, playlist_title, playlist_id = list_playlist(playlist_url, ydl_list)
     if not items:
         return []
 
+    # where symlinks and ledger/archive live
+    downloads_dir   = outdir.parent.resolve()
+    playlists_root  = downloads_dir / "dj_playlists"
+    playlists_root.mkdir(parents=True, exist_ok=True)
+
+    # playlist dir name: "{title} - {id}"
+    safe_title = (playlist_title or "playlist").strip()
+    safe_id    = (playlist_id or "").strip()
+    pl_dirname = safe_title
+    playlist_dir = playlists_root / pl_dirname
+    playlist_dir.mkdir(parents=True, exist_ok=True)
+
+    # write playlist.metadata
+    meta_path = playlist_dir / "playlist.metadata.json"
+    payload = {
+        "title": safe_title,
+        "id": safe_id,
+        "source_url": playlist_url,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "total_items": len(items),
+        "codec": codec,
+        "audio_outdir": str(outdir.resolve()),
+    }
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote %s", meta_path)
+    except Exception as e:
+        logging.warning("Failed to write playlist.metadata: %s", e)
+
+    # shared downloader instance for actual downloads
     ydl_dl = get_shared_ydl(
         listing=False, outdir=outdir, codec=codec, mp3_bitrate=mp3_bitrate,
-        cookies_from_browser=cookies_from_browser, cookiefile=cookiefile, force=force,
+        cookies_from_browser=cookies_from_browser, cookiefile=cookiefile,
     )
 
     saved: List[Path] = []
     for i, item in enumerate(items, 1):
         logging.info("[PLAYLIST %d/%d] %s", i, len(items), item.get("title"))
-        p, _ = download_one_with_ydl(
+        p, info = download_one_with_ydl(
             item["url"], ydl_dl, outdir=outdir, codec=codec,
             playlist_url=playlist_url,
             cookies_from_browser=cookies_from_browser,
             cookiefile=cookiefile,
-            force=force,
-            playlist_title=playlist_title,
+            playlist_title=safe_title,
         )
-        if p:
+        if p and p.exists():
             saved.append(p)
-            # create per-playlist symlink on success (also done inside, but harmless here)
-            playlists_root = outdir.parent / "dj_playlists"
-            _create_playlist_symlink(p, playlists_root, playlist_title)
+            # create/refresh symlink inside the playlist folder
+            try:
+                link = playlist_dir / p.name
+                if link.exists() or link.is_symlink():
+                    link.unlink()
+                rel = os.path.relpath(p, start=playlist_dir)
+                link.symlink_to(rel)
+            except Exception as e:
+                logging.warning("Symlink failed for %s -> %s: %s", link, p, e)
+
     return saved

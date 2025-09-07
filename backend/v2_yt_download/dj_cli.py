@@ -51,7 +51,7 @@ def _normalize_to_url(arg: str, site: str = "youtube", treat_as_playlist: bool |
 def _probe_is_playlist(url: str, *, codec: str, browser: str | None, cookiefile: str | None) -> bool:
     """Ask yt-dlp (flat) whether this is a playlist (has entries) or a single."""
     ydl = create_ydl(
-        listing=True, outdir=Path("."), codec=codec, mp3_bitrate="192",
+        listing=True, outdir=Path("."), codec=codec, mp3_bitrate="320",
         cookies_from_browser=browser, cookiefile=cookiefile
     )
     info = ydl.extract_info(url, download=False)
@@ -269,7 +269,7 @@ def parse_args():
     s.add_argument("url", help="YouTube video URL")
     s.add_argument("--outdir", default="downloads")
     s.add_argument("--codec", choices=["wav","mp3"], default="wav")
-    s.add_argument("--mp3-bitrate", default="192")
+    s.add_argument("--mp3-bitrate", default="320")
     s.add_argument("--browser", choices=["chrome","firefox","edge","brave","chromium"])
     s.add_argument("--cookiefile")
     s.set_defaults(func=cmd_download_one)
@@ -279,7 +279,7 @@ def parse_args():
     s.add_argument("playlist", help="YouTube playlist URL")
     s.add_argument("--outdir", default="downloads")
     s.add_argument("--codec", choices=["wav","mp3"], default="wav")
-    s.add_argument("--mp3-bitrate", default="192")
+    s.add_argument("--mp3-bitrate", default="320")
     s.add_argument("--browser", choices=["chrome","firefox","edge","brave","chromium"])
     s.add_argument("--cookiefile")
     s.set_defaults(func=cmd_download_playlist)
@@ -311,7 +311,7 @@ def parse_args():
     s.add_argument("--download", action="store_true", help="Actually download audio before analysis")
     s.add_argument("--downloaded-dir", help="If not downloading now, analyze files from this folder")
     s.add_argument("--codec", choices=["wav","mp3"], default="wav")
-    s.add_argument("--mp3-bitrate", default="192")
+    s.add_argument("--mp3-bitrate", default="320")
     s.add_argument("--browser", choices=["chrome","firefox","edge","brave","chromium"])
     s.add_argument("--cookiefile")
     s.set_defaults(func=cmd_analyze_playlist)

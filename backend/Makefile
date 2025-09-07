@@ -130,9 +130,9 @@ AUDIO_DIR := v2_yt_download/downloads/audio
 #   make delete-track PATH="v2_yt_download/downloads/audio/No Broke Boys.mp3"
 delete-track:
 	@if [ -n "$(TITLE)" ]; then \
-	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$TITLE"; \
+	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$TITLE"; \
 	elif [ -n "$(PATH)" ]; then \
-	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$PATH"; \
+	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$PATH"; \
 	else \
 	  echo "Usage: make delete-track TITLE='Exact Title'  OR  make delete-track PATH='path/to/file.mp3'"; \
 	  exit 1; \
@@ -145,14 +145,14 @@ delete-playlist:
 	@if [ -z "$(TITLE)" ]; then \
 	  echo "Usage: make delete-playlist TITLE='Playlist Title'"; exit 1; \
 	fi
-	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) delete-playlist "$(TITLE)"
+	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-playlist "$(TITLE)"
 
 # Dry-run wrappers (preview only)
 delete-track-dry:
 	@if [ -n "$(TITLE)" ]; then \
-	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$TITLE"; \
+	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$TITLE"; \
 	elif [ -n "$(PATH)" ]; then \
-	  python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$PATH"; \
+	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$PATH"; \
 	else \
 	  echo "Usage: make delete-track-dry TITLE='Exact Title'  OR  make delete-track-dry PATH='path/to/file.mp3'"; \
 	  exit 1; \
@@ -162,8 +162,22 @@ delete-playlist-dry:
 	@if [ -z "$(TITLE)" ]; then \
 	  echo "Usage: make delete-playlist-dry TITLE='Playlist Title'"; exit 1; \
 	fi
-	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-playlist "$(TITLE)"
+	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-playlist "$(TITLE)"
 
 # Clean orphans: broken symlinks + ledger rows pointing to missing files
 clean-orphans:
-	@python v2_yt_download/library_admin.py --outdir $(AUDIO_DIR) clean-orphans
+	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) clean-orphans
+
+
+# Delete only playlist symlinks + ledger/archive rows; keep audio files
+unlink-playlist:
+	@if [ -z "$(TITLE)" ]; then \
+	  echo "Usage: make unlink-playlist TITLE='Playlist Title'"; exit 1; \
+	fi
+	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --keep-audio delete-playlist "$(TITLE)"
+
+unlink-playlist-dry:
+	@if [ -z "$(TITLE)" ]; then \
+	  echo "Usage: make unlink-playlist-dry TITLE='Playlist Title'"; exit 1; \
+	fi
+	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --keep-audio --dry-run delete-playlist "$(TITLE)"
