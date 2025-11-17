@@ -1,0 +1,49 @@
+# === Python / Backend ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter / analysis
+.ipynb_checkpoints/
+
+# Local data / downloads
+downloads/
+*.djmeta.json
+*.csv
+
+# OS files
+.DS_Store
+
+# === Frontend / Node ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build artifacts
+dist/
+build/
+.cache/
+coverage/
+*.tsbuildinfo
+
+# === IDEs / Editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
