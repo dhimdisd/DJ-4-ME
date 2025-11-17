@@ -124,17 +124,19 @@ clean:
 
 AUDIO_DIR := v2_yt_download/downloads/audio
 
-# Delete a single track by TITLE or by PATH
+.PHONY: delete-track delete-playlist delete-track-dry delete-playlist-dry
+
+# Delete a single track by TITLE or by FILE path
 # Usage:
 #   make delete-track TITLE="No Broke Boys"
-#   make delete-track PATH="v2_yt_download/downloads/audio/No Broke Boys.mp3"
+#   make delete-track FILE="v2_yt_download/downloads/audio/No Broke Boys.mp3"
 delete-track:
 	@if [ -n "$(TITLE)" ]; then \
-	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$TITLE"; \
-	elif [ -n "$(PATH)" ]; then \
-	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-track "$$PATH"; \
+	  python $(BACKEND_DIR)/util/library_admin.py delete-track --outdir $(AUDIO_DIR) "$$TITLE"; \
+	elif [ -n "$(FILE)" ]; then \
+	  python $(BACKEND_DIR)/util/library_admin.py delete-track --outdir $(AUDIO_DIR) "$$FILE"; \
 	else \
-	  echo "Usage: make delete-track TITLE='Exact Title'  OR  make delete-track PATH='path/to/file.mp3'"; \
+	  echo "Usage: make delete-track TITLE='Exact Title'  OR  make delete-track FILE='path/to/file.mp3'"; \
 	  exit 1; \
 	fi
 
@@ -145,16 +147,16 @@ delete-playlist:
 	@if [ -z "$(TITLE)" ]; then \
 	  echo "Usage: make delete-playlist TITLE='Playlist Title'"; exit 1; \
 	fi
-	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) delete-playlist "$(TITLE)"
+	@python $(BACKEND_DIR)/util/library_admin.py delete-playlist --outdir $(AUDIO_DIR) "$(TITLE)"
 
 # Dry-run wrappers (preview only)
 delete-track-dry:
 	@if [ -n "$(TITLE)" ]; then \
-	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$TITLE"; \
-	elif [ -n "$(PATH)" ]; then \
-	  python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-track "$$PATH"; \
+	  python $(BACKEND_DIR)/util/library_admin.py delete-track --outdir $(AUDIO_DIR) --dry-run "$$TITLE"; \
+	elif [ -n "$(FILE)" ]; then \
+	  python $(BACKEND_DIR)/util/library_admin.py delete-track --outdir $(AUDIO_DIR) --dry-run "$$FILE"; \
 	else \
-	  echo "Usage: make delete-track-dry TITLE='Exact Title'  OR  make delete-track-dry PATH='path/to/file.mp3'"; \
+	  echo "Usage: make delete-track-dry TITLE='Exact Title'  OR  make delete-track-dry FILE='path/to/file.mp3'"; \
 	  exit 1; \
 	fi
 
@@ -162,14 +164,15 @@ delete-playlist-dry:
 	@if [ -z "$(TITLE)" ]; then \
 	  echo "Usage: make delete-playlist-dry TITLE='Playlist Title'"; exit 1; \
 	fi
-	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --dry-run delete-playlist "$(TITLE)"
+	@python $(BACKEND_DIR)/util/library_admin.py delete-playlist --outdir $(AUDIO_DIR) --dry-run "$(TITLE)"
 
 # Clean orphans: broken symlinks + ledger rows pointing to missing files
 clean-orphans:
-	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) clean-orphans
-
+	python $(BACKEND_DIR)/util/library_admin.py clean-orphans --outdir $(AUDIO_DIR)
 
 # Delete only playlist symlinks + ledger/archive rows; keep audio files
+# Usage:
+#   make unlink-playlist TITLE="Afro House 2025"
 unlink-playlist:
 	@if [ -z "$(TITLE)" ]; then \
 	  echo "Usage: make unlink-playlist TITLE='Playlist Title'"; exit 1; \
@@ -181,3 +184,12 @@ unlink-playlist-dry:
 	  echo "Usage: make unlink-playlist-dry TITLE='Playlist Title'"; exit 1; \
 	fi
 	@python v2_yt_download/util/library_admin.py --outdir $(AUDIO_DIR) --keep-audio --dry-run delete-playlist "$(TITLE)"
+
+
+## Rebuild playlist symlinks from ledger (and normalize any real files)
+sync-playlists:
+	python $(BACKEND_DIR)/util/library_admin.py sync-playlists --outdir $(BACKEND_DIR)/downloads/audio --normalize
+
+sync-all:
+	$(MAKE) sync-playlists
+	$(MAKE) clean-orphans
